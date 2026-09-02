@@ -323,7 +323,7 @@
                     <div class="label" data-i18n="productWeight">商品重量</div>
                     <div class="input-group">
                         <div class="input-box"><span class="unit">kg</span>
-                            <input type="number" id="productWeight" placeholder="0" value="0" step="0.1" min="0" max="1000" oninput="updateFulfillmentFee()">
+                            <input type="number" id="productWeight" placeholder="0" value="0" step="0.1" min="0" max="1000" oninput="updateFulfillmentFee()" onblur="clampNum(this, 0, 1000)">
                         </div>
                         <span class="converted" id="fulfillmentFeeDisplay">€ 0.00</span>
                     </div>
@@ -332,7 +332,7 @@
                     <div class="label" data-i18n="pkgDimSum">包装三边和（长+宽+高）</div>
                     <div class="input-group">
                         <div class="input-box"><span class="unit">cm</span>
-                            <input type="number" id="pkgDimSum" placeholder="0" value="0" step="1" min="0" oninput="updateFulfillmentFee()">
+                            <input type="number" id="pkgDimSum" placeholder="0" value="0" step="1" min="0" max="500" oninput="updateFulfillmentFee()" onblur="clampNum(this, 0, 500)">
                         </div>
                         <span class="converted" id="oversizeFeeDisplay" style="color:#8b949e;font-size:12px;">€ 0.00</span>
                     </div>
@@ -483,6 +483,7 @@
         <div class="hidden" id="resultSection" style="margin-top: 24px;">
             <div class="platform-card">
                 <div class="platform-card-header">🔵 Cdiscount Marketplace</div>
+                <div id="cd-blocked-banner" style="display:none;margin:16px 20px 0;padding:12px 14px;border:1px solid #f85149;border-radius:8px;background:rgba(248,81,73,0.08);color:#f85149;font-size:13px;line-height:1.6;"></div>
                 <div class="platform-card-body">
                     <div class="card-row">
                         <span data-i18n="priceWithTax">商品售价（含税 TTC）</span>
@@ -613,9 +614,14 @@
             { key: 'sofa',      zh: '沙发',       fr: 'Canapé',                en: 'Sofa',             rates: [44.50, 46.30, 51.20, 53.50, 55.50, 56.60, 57.60] }
         ];
 
-        const M30_MAX_KG = 30;      // M30 上限重量
-        const M30_MAX_DIM = 200;    // M30 上限三边和 (cm)
-        const WEIGHT_SANITY_KG = 1000;  // 超过视为输入错误
+        // PDF 第12页注：M30 适用于「30公斤以下 且 长宽高总和小于2米」
+        // PDF 第13页注：P30 适用于「大于或等于30公斤以上 或 长宽高相加大于2米」
+        // => 正好 30kg / 正好 200cm 都归 P30（取成本高的一侧，不低估）
+        const M30_MAX_KG = 30;          // 严格小于才算 M30
+        const M30_MAX_DIM = 200;        // 严格小于才算 M30
+        const P30_OPEN_BAND_KG = 140;   // 报价表最后一档 "+140" 为开口档
+        const WEIGHT_SANITY_KG = 1000;  // 单件超过 1 吨视为输入错误，拒绝出数
+        const DIM_SANITY_CM = 500;      // 报价表附加费最远只到 5m，超过拒绝出数
 
         function getP30BandIndex(weightKg) {
             for (let i = 0; i < P30_BANDS.length; i++) {
@@ -624,42 +630,54 @@
             return P30_BANDS.length - 1;
         }
 
-        // 返回 { mode, base, surcharge, total, returnFee, warn }
-        // mode: 'none'(自发货) | 'M30' | 'P30'
+        // 返回 { status, mode, base, surcharge, total, returnFee, note }
+        // status: 'ok'          可以出数
+        //         'none'        自发货，不使用海外仓
+        //         'needCategory' P30 但未选品类 —— 拒绝出数
+        //         'outOfRange'  输入超出合理范围 —— 拒绝出数
+        // 重要：status 不是 ok/none 时，调用方必须不显示任何费用/利润数字。
         function getOctopiaFulfillment(weightKg, dimSumCm, p30Idx) {
             const w = weightKg > 0 ? weightKg : 0;
             const d = dimSumCm > 0 ? dimSumCm : 0;
-            const empty = { mode: 'none', base: 0, surcharge: 0, total: 0, returnFee: 0, warn: '' };
-            if (w <= 0) return empty;
+            const blank = { status: 'none', mode: 'none', base: 0, surcharge: 0, total: 0, returnFee: 0, note: '' };
+            if (w <= 0) return blank;
 
-            const isP30 = (w > M30_MAX_KG) || (d > M30_MAX_DIM);
+            // —— 输入合理性：超出范围一律拒绝出数，不沿用任何档位价格 ——
+            if (w > WEIGHT_SANITY_KG) {
+                return Object.assign({}, blank, { status: 'outOfRange', mode: 'P30', note: 'weightOver' });
+            }
+            if (d > DIM_SANITY_CM) {
+                return Object.assign({}, blank, { status: 'outOfRange', mode: 'P30', note: 'dimOver' });
+            }
+
+            const isP30 = (w >= M30_MAX_KG) || (d >= M30_MAX_DIM);
 
             if (!isP30) {
-                // M30 小件：按重量档，找不到档位说明已超 30kg（前面已排除）
-                let base = octopiaM30Rates[octopiaM30Rates.length - 1].price;
+                // M30 小件（w < 30kg 且 三边和 < 200cm）
+                let base = null;
                 for (const tier of octopiaM30Rates) {
                     if (w <= tier.maxKg) { base = tier.price; break; }
                 }
+                if (base === null) return Object.assign({}, blank, { status: 'outOfRange', mode: 'M30', note: 'weightOver' });
                 // 超大包裹：1.5m < 长+宽+高 < 2m : 4€
-                const surcharge = (d > 150 && d <= 200) ? 4 : 0;
-                return { mode: 'M30', base: base, surcharge: surcharge, total: base + surcharge,
-                         returnFee: 4, warn: '' };   // 消费者退货 4€（非物流原因）
+                const surcharge = (d > 150 && d < 200) ? 4 : 0;
+                return { status: 'ok', mode: 'M30', base: base, surcharge: surcharge,
+                         total: base + surcharge, returnFee: 4, note: '' };  // 消费者退货 4€（非物流原因）
             }
 
-            // P30 大件：按品类 + 重量档
-            const cat = octopiaP30Categories[p30Idx] || octopiaP30Categories[0];
+            // P30 大件：品类必选，不给默认值（默认「其他」是最便宜的一列，会系统性高估利润）
+            const cat = octopiaP30Categories[p30Idx];
+            if (!cat) return Object.assign({}, blank, { status: 'needCategory', mode: 'P30' });
+
             const base = cat.rates[getP30BandIndex(w)];
             // 超大包裹：3m<和<4m : 5€ ; 4m<和<5m : 10€
             let surcharge = 0;
             if (d > 300 && d <= 400) surcharge = 5;
             else if (d > 400 && d <= 500) surcharge = 10;
-            let warn = '';
-            if (w > WEIGHT_SANITY_KG) warn = 'weightOver';
-            else if (d > 500) warn = 'dimOver';
-            const total = base + surcharge;
-            // 消费者退货 = 配送费的150%（不含附加费）
-            return { mode: 'P30', base: base, surcharge: surcharge, total: total,
-                     returnFee: base * 1.5, warn: warn, catKey: cat.key };
+            // +140kg 是报价表开口档：140kg 和 900kg 同价，属报价表本身的边界，需向 Octopia 确认
+            const note = (w >= P30_OPEN_BAND_KG) ? 'openBand' : '';
+            return { status: 'ok', mode: 'P30', base: base, surcharge: surcharge,
+                     total: base + surcharge, returnFee: base * 1.5, note: note, catKey: cat.key };
         }
 
         // ========== Cdiscount Categories (with trilingual names) ==========
@@ -705,14 +723,18 @@
                 pkgDimSum: "包装三边和（长+宽+高）",
                 p30Category: "大件品类（P30）",
                 fulfillmentNote: "💡 重量>30kg 或 三边和>200cm 自动切换 P30 大件费率（按品类）。含超大包裹附加费。自发货重量填0。费率来源：Octopia 2025报价（M30 第12页 / P30 第13页）",
-                modeM30: "M30 小件（≤30kg 且三边和≤200cm）",
-                modeP30: "P30 大件（>30kg 或三边和>200cm）",
+                modeM30: "M30 小件（<30kg 且三边和<200cm）",
+                modeP30: "P30 大件（≥30kg 或三边和≥200cm）",
+                p30Placeholder: "— 请选择大件品类 —",
+                noteOpenBand: "⚠️ ≥140kg 落在报价表 +140 开口档：140kg 与 900kg 同价，实际重量超常规请向 Octopia 确认",
+                blockNeedCategory: "⛔ P30 大件必须选择品类后才能计算 —— 六个品类费率相差最多 2 倍，不设默认值",
+                blockWeightOver: "⛔ 单件重量超过 1000kg，超出海外仓报价表适用范围，本工具不给出估算，请联系 Octopia 客户经理单独报价",
+                blockDimOver: "⛔ 三边和超过 500cm，超出报价表超大包裹附加费适用范围，本工具不给出估算，请联系 Octopia 客户经理单独报价",
+                clampedToast: "⚠️ 已修正到有效区间 {lo}–{hi}",
                 modeNone: "自发货（不使用海外仓）",
                 ffBase: "基础派送费",
                 ffOversize: "超大包裹附加费",
                 ffReturn: "退货处理费/单",
-                warnWeightOver: "⚠️ 重量超出 Octopia 报价表范围，请联系客户经理单独报价",
-                warnDimOver: "⚠️ 三边和 >5m 超出报价表范围，需单独报价",
                 longStorage: "存储超过1年",
                 storageRate15: "€15/m³/月",
                 storageRate50: "€50/m³/月（>1年）",
@@ -760,14 +782,18 @@
                 pkgDimSum: "Somme L+l+H de l'emballage",
                 p30Category: "Catégorie gros colis (P30)",
                 fulfillmentNote: "💡 Poids>30kg ou L+l+H>200cm bascule automatiquement sur les tarifs P30 (par catégorie). Surcharges hors gabarit incluses. 0 = expédition propre. Tarifs Octopia 2025 (M30 p.12 / P30 p.13)",
-                modeM30: "M30 petit colis (≤30kg et L+l+H≤200cm)",
-                modeP30: "P30 gros colis (>30kg ou L+l+H>200cm)",
+                modeM30: "M30 petit colis (<30kg et L+l+H<200cm)",
+                modeP30: "P30 gros colis (≥30kg ou L+l+H≥200cm)",
+                p30Placeholder: "— Choisir la catégorie —",
+                noteOpenBand: "⚠️ ≥140kg correspond à la tranche ouverte \"+140\" : 140kg et 900kg au même tarif, à confirmer avec Octopia",
+                blockNeedCategory: "⛔ Sélectionnez la catégorie P30 pour calculer — les six catégories varient du simple au double, aucune valeur par défaut",
+                blockWeightOver: "⛔ Poids unitaire > 1000kg, hors grille tarifaire entrepôt. Aucune estimation fournie, demandez un devis à Octopia",
+                blockDimOver: "⛔ L+l+H > 500cm, hors grille des surcharges hors gabarit. Aucune estimation fournie, demandez un devis à Octopia",
+                clampedToast: "⚠️ Corrigé dans la plage valide {lo}–{hi}",
                 modeNone: "Expédition propre (sans entrepôt)",
                 ffBase: "Frais de livraison de base",
                 ffOversize: "Surcharge hors gabarit",
                 ffReturn: "Frais de retour/unité",
-                warnWeightOver: "⚠️ Poids hors grille tarifaire Octopia, demandez un devis",
-                warnDimOver: "⚠️ L+l+H >5m hors grille tarifaire, devis nécessaire",
                 longStorage: "Stockage > 1 an",
                 storageRate15: "€15/m³/mois",
                 storageRate50: "€50/m³/mois (>1 an)",
@@ -815,14 +841,18 @@
                 pkgDimSum: "Package L+W+H total",
                 p30Category: "Bulky category (P30)",
                 fulfillmentNote: "💡 Weight>30kg or L+W+H>200cm automatically switches to P30 bulky rates (by category). Oversize surcharges included. Enter 0 for self-shipping. Rates: Octopia 2025 (M30 p.12 / P30 p.13)",
-                modeM30: "M30 small parcel (≤30kg and L+W+H≤200cm)",
-                modeP30: "P30 bulky (>30kg or L+W+H>200cm)",
+                modeM30: "M30 small parcel (<30kg and L+W+H<200cm)",
+                modeP30: "P30 bulky (≥30kg or L+W+H≥200cm)",
+                p30Placeholder: "— Select bulky category —",
+                noteOpenBand: "⚠️ ≥140kg falls in the open \"+140\" band: 140kg and 900kg cost the same, confirm with Octopia",
+                blockNeedCategory: "⛔ Select a P30 category to calculate — the six categories differ by up to 2x, no default is assumed",
+                blockWeightOver: "⛔ Unit weight over 1000kg is outside the warehouse rate card. No estimate is given, request a quote from Octopia",
+                blockDimOver: "⛔ L+W+H over 500cm is outside the oversize surcharge range. No estimate is given, request a quote from Octopia",
+                clampedToast: "⚠️ Clamped to the valid range {lo}–{hi}",
                 modeNone: "Self-shipping (no warehouse)",
                 ffBase: "Base delivery fee",
                 ffOversize: "Oversize surcharge",
                 ffReturn: "Return handling/unit",
-                warnWeightOver: "⚠️ Weight beyond the Octopia rate card, request a custom quote",
-                warnDimOver: "⚠️ L+W+H >5m beyond the rate card, custom quote needed",
                 longStorage: "Stored over 1 year",
                 storageRate15: "€15/m³/month",
                 storageRate50: "€50/m³/month (>1 year)",
@@ -899,50 +929,80 @@
             loadHistory();
         }
 
+        // 失焦时把越界输入夹回合理区间，避免 1.5 亿 kg 这类明显误输入留在表单里
+        function clampNum(el, lo, hi) {
+            const v = parseFloat(el.value);
+            if (isNaN(v)) return;
+            const c = Math.min(hi, Math.max(lo, v));
+            if (c !== v) {
+                el.value = c;
+                showToast(i18n[currentLang].clampedToast.replace('{lo}', lo).replace('{hi}', hi));
+            }
+            updateFulfillmentFee();
+            if (!document.getElementById('resultSection').classList.contains('hidden')) calculate();
+        }
+
         function buildP30Select() {
             const sel = document.getElementById('p30Category');
-            const prevIdx = sel.selectedIndex;
+            const prevVal = sel.value;
             sel.innerHTML = '';
+            const ph = document.createElement('option');
+            ph.value = '';
+            ph.textContent = i18n[currentLang].p30Placeholder;
+            sel.appendChild(ph);
             octopiaP30Categories.forEach((cat, i) => {
                 const opt = document.createElement('option');
                 opt.value = i;
                 opt.textContent = cat[currentLang];
                 sel.appendChild(opt);
             });
-            sel.selectedIndex = prevIdx >= 0 ? prevIdx : 0;
+            sel.value = prevVal !== null ? prevVal : '';
         }
 
         // 读取当前海外仓输入，返回费用明细对象
         function readFulfillment() {
             const w = parseFloat(document.getElementById('productWeight').value) || 0;
             const d = parseFloat(document.getElementById('pkgDimSum').value) || 0;
-            const idx = parseInt(document.getElementById('p30Category').value, 10) || 0;
+            const raw = document.getElementById('p30Category').value;
+            const idx = raw === '' ? -1 : parseInt(raw, 10);
             return getOctopiaFulfillment(w, d, idx);
         }
 
         function updateFulfillmentFee() {
             const lang = i18n[currentLang];
             const ff = readFulfillment();
+            const bd = document.getElementById('fulfillmentBreakdown');
+            const feeEl = document.getElementById('fulfillmentFeeDisplay');
+            const surEl = document.getElementById('oversizeFeeDisplay');
 
             // P30 品类下拉只在大件模式显示
             document.getElementById('p30CategoryRow').style.display = (ff.mode === 'P30') ? '' : 'none';
 
-            document.getElementById('fulfillmentFeeDisplay').textContent = '€ ' + ff.total.toFixed(2);
-            document.getElementById('oversizeFeeDisplay').textContent = '€ ' + ff.surcharge.toFixed(2);
-
-            const bd = document.getElementById('fulfillmentBreakdown');
-            if (ff.mode === 'none') {
-                bd.innerHTML = '<span style="color:#484f58;">' + lang.modeNone + '</span>';
-            } else {
+            if (ff.status === 'ok') {
+                feeEl.textContent = '€ ' + ff.total.toFixed(2);
+                feeEl.style.color = '';
+                surEl.textContent = '€ ' + ff.surcharge.toFixed(2);
                 const modeTxt = ff.mode === 'M30' ? lang.modeM30 : lang.modeP30;
                 let html = '<span style="color:#a78bfa;font-weight:600;">' + modeTxt + '</span><br>'
                          + lang.ffBase + '：€' + ff.base.toFixed(2)
                          + ' &nbsp;+&nbsp; ' + lang.ffOversize + '：€' + ff.surcharge.toFixed(2)
                          + ' &nbsp;=&nbsp; <span style="color:#e6edf3;font-weight:600;">€' + ff.total.toFixed(2) + '</span><br>'
                          + lang.ffReturn + '：€' + ff.returnFee.toFixed(2);
-                if (ff.warn === 'weightOver') html += '<br><span style="color:#f85149;">' + lang.warnWeightOver + '</span>';
-                else if (ff.warn === 'dimOver') html += '<br><span style="color:#f85149;">' + lang.warnDimOver + '</span>';
+                if (ff.note === 'openBand') html += '<br><span style="color:#d29922;">' + lang.noteOpenBand + '</span>';
                 bd.innerHTML = html;
+            } else {
+                // 拒绝出数：任何费用都不显示数字
+                feeEl.textContent = '—';
+                surEl.textContent = '—';
+                if (ff.status === 'none') {
+                    feeEl.style.color = '';
+                    bd.innerHTML = '<span style="color:#484f58;">' + lang.modeNone + '</span>';
+                } else {
+                    feeEl.style.color = '#f85149';
+                    const msg = ff.status === 'needCategory' ? lang.blockNeedCategory
+                              : (ff.note === 'weightOver' ? lang.blockWeightOver : lang.blockDimOver);
+                    bd.innerHTML = '<span style="color:#f85149;font-weight:600;">' + msg + '</span>';
+                }
             }
         }
 
@@ -1033,11 +1093,31 @@
             const storageVol = parseFloat(document.getElementById('storageVolume').value) || 0;
             const storageFeePerUnit = sales > 0 ? (storageVol * getStorageRate()) / sales : 0;
             const ff = readFulfillment();
+
+            if (sp <= 0) { alert(lang.enterPrice); return; }
+
+            // 海外仓输入不合法时：显示结果卡但一个数字都不给，避免卖家拿到假报价
+            const banner = document.getElementById('cd-blocked-banner');
+            if (ff.status === 'needCategory' || ff.status === 'outOfRange') {
+                banner.textContent = ff.status === 'needCategory' ? lang.blockNeedCategory
+                                   : (ff.note === 'weightOver' ? lang.blockWeightOver : lang.blockDimOver);
+                banner.style.display = '';
+                document.getElementById('resultSection').classList.remove('hidden');
+                ['cd-price','cd-vat','cd-comm','cd-fulfillment','cd-oversize','cd-monthly-fee','cd-storage',
+                 'cd-ad-promo','cd-return','cd-return-handling','cd-total-cost','cd-profit','cd-margin',
+                 'cd-monthly-profit'].forEach(id => { document.getElementById(id).textContent = '—'; });
+                document.getElementById('cd-ff-mode').textContent = '';
+                document.getElementById('cd-oversize-row').style.display = '';
+                document.getElementById('cd-profit').style.color = '#f85149';
+                document.getElementById('cd-monthly-profit').style.color = '#f85149';
+                document.getElementById('resultSection').scrollIntoView({ behavior: 'smooth' });
+                return;
+            }
+            banner.style.display = 'none';
+
             const fulfillmentFee = ff.base;
             const oversizeFee = ff.surcharge;
             const returnHandlingFee = ff.returnFee * returnRateVal;  // 按退货率摊到每单
-
-            if (sp <= 0) { alert(lang.enterPrice); return; }
 
             const totalCostEUR = (purchaseCost + shippingCost + packagingCost + otherCost) * rate;
             const vatAmount = vatFrac > 0 ? sp * vatFrac / (1 + vatFrac) : 0;
@@ -1139,7 +1219,7 @@
                 returnRate: document.getElementById('returnRate').value,
                 productWeight: document.getElementById('productWeight').value,
                 pkgDimSum: document.getElementById('pkgDimSum').value,
-                p30CategoryIndex: document.getElementById('p30Category').selectedIndex,
+                p30CategoryValue: document.getElementById('p30Category').value,
                 longStorage: document.getElementById('longStorage').checked,
                 storageVolume: document.getElementById('storageVolume').value,
                 monthlySales: document.getElementById('monthlySales').value,
@@ -1192,7 +1272,7 @@
             document.getElementById('returnRate').value = r.returnRate || '5';
             document.getElementById('productWeight').value = r.productWeight || '0';
             document.getElementById('pkgDimSum').value = r.pkgDimSum || '0';
-            document.getElementById('p30Category').selectedIndex = r.p30CategoryIndex || 0;
+            document.getElementById('p30Category').value = (r.p30CategoryValue !== undefined ? r.p30CategoryValue : '');
             document.getElementById('longStorage').checked = !!r.longStorage;
             document.getElementById('storageVolume').value = r.storageVolume || '0';
             document.getElementById('monthlySales').value = r.monthlySales || '100';
