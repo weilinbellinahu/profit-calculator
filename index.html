@@ -323,13 +323,32 @@
                     <div class="label" data-i18n="productWeight">商品重量</div>
                     <div class="input-group">
                         <div class="input-box"><span class="unit">kg</span>
-                            <input type="number" id="productWeight" placeholder="0" value="0" step="0.1" oninput="updateFulfillmentFee()">
+                            <input type="number" id="productWeight" placeholder="0" value="0" step="0.1" min="0" max="1000" oninput="updateFulfillmentFee()">
                         </div>
                         <span class="converted" id="fulfillmentFeeDisplay">€ 0.00</span>
                     </div>
                 </div>
+                <div class="form-row">
+                    <div class="label" data-i18n="pkgDimSum">包装三边和（长+宽+高）</div>
+                    <div class="input-group">
+                        <div class="input-box"><span class="unit">cm</span>
+                            <input type="number" id="pkgDimSum" placeholder="0" value="0" step="1" min="0" oninput="updateFulfillmentFee()">
+                        </div>
+                        <span class="converted" id="oversizeFeeDisplay" style="color:#8b949e;font-size:12px;">€ 0.00</span>
+                    </div>
+                </div>
+                <div class="form-row" id="p30CategoryRow" style="display:none;">
+                    <div class="label" data-i18n="p30Category">大件品类（P30）</div>
+                    <div class="input-group">
+                        <div class="input-box">
+                            <select id="p30Category" onchange="updateFulfillmentFee()"></select>
+                        </div>
+                        <span class="converted" id="p30ModeBadge" style="color:#8b949e;font-size:12px;"></span>
+                    </div>
+                </div>
+                <div id="fulfillmentBreakdown" style="font-size:12px;color:#8b949e;padding:8px 0 0;line-height:1.7;"></div>
                 <div style="font-size: 11px; color: #484f58; padding: 6px 0 4px; line-height: 1.6;" data-i18n="fulfillmentNote">
-                    💡 Cdiscount海外仓(M30≤30kg)派送费，含拣货打包运输。自发货填0。费率来源：Octopia 2025报价
+                    💡 重量>30kg 或 三边和>200cm 自动切换 P30 大件费率（按品类）。含超大包裹附加费。自发货重量填0。费率来源：Octopia 2025报价（M30 第12页 / P30 第13页）
                 </div>
             </div>
         </div>
@@ -426,6 +445,15 @@
                         <span class="converted" id="storageFeeInfo" style="color: #8b949e; font-size: 12px;" data-i18n="storageNote">€15/m³/月 · 自发货填0</span>
                     </div>
                 </div>
+                <div class="form-row">
+                    <div class="label" data-i18n="longStorage">存储超过1年</div>
+                    <div class="input-group">
+                        <label style="display:flex;align-items:center;gap:8px;height:38px;cursor:pointer;color:#8b949e;font-size:13px;">
+                            <input type="checkbox" id="longStorage" onchange="updateStorageFeeDisplay(); if(!document.getElementById('resultSection').classList.contains('hidden')) calculate();" style="width:16px;height:16px;accent-color:#a78bfa;">
+                            <span id="storageRateInfo">€15/m³/月</span>
+                        </label>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -469,8 +497,12 @@
                         <span id="cd-comm">-€0.00</span>
                     </div>
                     <div class="card-row">
-                        <span data-i18n="fulfillmentFeeLabel">海外仓派送费 (Octopia)</span>
+                        <span><span data-i18n="fulfillmentFeeLabel">海外仓派送费 (Octopia)</span> <span id="cd-ff-mode" style="color:#a78bfa;font-size:12px;"></span></span>
                         <span id="cd-fulfillment">-€0.00</span>
+                    </div>
+                    <div class="card-row" id="cd-oversize-row" style="display:none;">
+                        <span data-i18n="oversizeFeeLabel">超大包裹附加费</span>
+                        <span id="cd-oversize">-€0.00</span>
                     </div>
                     <div class="card-row">
                         <span data-i18n="monthlyFeeShare">月租分摊（€39.99/月）</span>
@@ -487,6 +519,10 @@
                     <div class="card-row">
                         <span data-i18n="returnCostLabel">退货成本</span>
                         <span id="cd-return">-€0.00</span>
+                    </div>
+                    <div class="card-row">
+                        <span data-i18n="returnHandlingLabel">退货处理费（Octopia）</span>
+                        <span id="cd-return-handling">-€0.00</span>
                     </div>
                     <div class="card-row">
                         <span data-i18n="totalCostEur">采购+物流成本（换算€）</span>
@@ -564,12 +600,66 @@
             { maxKg: 30, price: 12.90 }
         ];
 
-        function getOctopiaFulfillmentFee(weightKg) {
-            if (weightKg <= 0) return 0;
-            for (const tier of octopiaM30Rates) {
-                if (weightKg <= tier.maxKg) return tier.price;
+        // ========== Octopia Fulfillment P30 大件 ==========
+        // Source: PDF page 13 - 派送费用 P30大件产品 使用于CDISCOUNT平台
+        // 适用：重量 >= 30kg 或 长宽高总和 > 2m
+        const P30_BANDS = [30, 50, 70, 90, 110, 140, Infinity];  // 表头 <30 / <50 / <70 / <90 / <110 / <140 / +140
+        const octopiaP30Categories = [
+            { key: 'other',     zh: '其他',       fr: 'Autres',                en: 'Other',            rates: [22.60, 23.00, 24.00, 25.00, 25.60, 27.30, 29.30] },
+            { key: 'appliance', zh: '大型家电',   fr: 'Gros électroménager',   en: 'Large appliances', rates: [25.90, 26.90, 28.00, 33.00, 44.70, 46.50, 47.90] },
+            { key: 'furniture', zh: '家具',       fr: 'Meubles',               en: 'Furniture',        rates: [25.50, 28.00, 30.20, 35.40, 43.90, 48.60, 51.70] },
+            { key: 'bedding',   zh: '床品',       fr: 'Literie',               en: 'Bedding',          rates: [25.70, 28.90, 35.50, 37.60, 43.90, 57.50, 63.70] },
+            { key: 'garden',    zh: '园艺',       fr: 'Jardin',                en: 'Garden',           rates: [28.00, 29.40, 31.20, 35.10, 38.70, 39.10, 45.70] },
+            { key: 'sofa',      zh: '沙发',       fr: 'Canapé',                en: 'Sofa',             rates: [44.50, 46.30, 51.20, 53.50, 55.50, 56.60, 57.60] }
+        ];
+
+        const M30_MAX_KG = 30;      // M30 上限重量
+        const M30_MAX_DIM = 200;    // M30 上限三边和 (cm)
+        const WEIGHT_SANITY_KG = 1000;  // 超过视为输入错误
+
+        function getP30BandIndex(weightKg) {
+            for (let i = 0; i < P30_BANDS.length; i++) {
+                if (weightKg < P30_BANDS[i]) return i;
             }
-            return 12.90;
+            return P30_BANDS.length - 1;
+        }
+
+        // 返回 { mode, base, surcharge, total, returnFee, warn }
+        // mode: 'none'(自发货) | 'M30' | 'P30'
+        function getOctopiaFulfillment(weightKg, dimSumCm, p30Idx) {
+            const w = weightKg > 0 ? weightKg : 0;
+            const d = dimSumCm > 0 ? dimSumCm : 0;
+            const empty = { mode: 'none', base: 0, surcharge: 0, total: 0, returnFee: 0, warn: '' };
+            if (w <= 0) return empty;
+
+            const isP30 = (w > M30_MAX_KG) || (d > M30_MAX_DIM);
+
+            if (!isP30) {
+                // M30 小件：按重量档，找不到档位说明已超 30kg（前面已排除）
+                let base = octopiaM30Rates[octopiaM30Rates.length - 1].price;
+                for (const tier of octopiaM30Rates) {
+                    if (w <= tier.maxKg) { base = tier.price; break; }
+                }
+                // 超大包裹：1.5m < 长+宽+高 < 2m : 4€
+                const surcharge = (d > 150 && d <= 200) ? 4 : 0;
+                return { mode: 'M30', base: base, surcharge: surcharge, total: base + surcharge,
+                         returnFee: 4, warn: '' };   // 消费者退货 4€（非物流原因）
+            }
+
+            // P30 大件：按品类 + 重量档
+            const cat = octopiaP30Categories[p30Idx] || octopiaP30Categories[0];
+            const base = cat.rates[getP30BandIndex(w)];
+            // 超大包裹：3m<和<4m : 5€ ; 4m<和<5m : 10€
+            let surcharge = 0;
+            if (d > 300 && d <= 400) surcharge = 5;
+            else if (d > 400 && d <= 500) surcharge = 10;
+            let warn = '';
+            if (w > WEIGHT_SANITY_KG) warn = 'weightOver';
+            else if (d > 500) warn = 'dimOver';
+            const total = base + surcharge;
+            // 消费者退货 = 配送费的150%（不含附加费）
+            return { mode: 'P30', base: base, surcharge: surcharge, total: total,
+                     returnFee: base * 1.5, warn: warn, catKey: cat.key };
         }
 
         // ========== Cdiscount Categories (with trilingual names) ==========
@@ -612,7 +702,20 @@
                 shippingCost: "头程运费", packagingCost: "包装成本", otherCost: "其他成本",
                 fulfillmentSection: "海外仓派送费 (Octopia Fulfillment)",
                 productWeight: "商品重量",
-                fulfillmentNote: "💡 Cdiscount海外仓(M30≤30kg)派送费，含拣货打包运输。自发货填0。费率来源：Octopia 2025报价",
+                pkgDimSum: "包装三边和（长+宽+高）",
+                p30Category: "大件品类（P30）",
+                fulfillmentNote: "💡 重量>30kg 或 三边和>200cm 自动切换 P30 大件费率（按品类）。含超大包裹附加费。自发货重量填0。费率来源：Octopia 2025报价（M30 第12页 / P30 第13页）",
+                modeM30: "M30 小件（≤30kg 且三边和≤200cm）",
+                modeP30: "P30 大件（>30kg 或三边和>200cm）",
+                modeNone: "自发货（不使用海外仓）",
+                ffBase: "基础派送费",
+                ffOversize: "超大包裹附加费",
+                ffReturn: "退货处理费/单",
+                warnWeightOver: "⚠️ 重量超出 Octopia 报价表范围，请联系客户经理单独报价",
+                warnDimOver: "⚠️ 三边和 >5m 超出报价表范围，需单独报价",
+                longStorage: "存储超过1年",
+                storageRate15: "€15/m³/月",
+                storageRate50: "€50/m³/月（>1年）",
                 marketingCost: "营销成本", adCost: "站内广告", promoCost: "站内促销成本",
                 afterSalesCost: "售后成本", returnRate: "退货率",
                 platformFees: "平台扣费", category: "商品类别",
@@ -630,6 +733,8 @@
                 storageFeeLabel: "仓储费（Octopia Fulfillment）",
                 adCostLabel: "广告+促销",
                 returnCostLabel: "退货成本",
+                oversizeFeeLabel: "超大包裹附加费",
+                returnHandlingLabel: "退货处理费（Octopia）",
                 totalCostEur: "采购+物流成本（换算€）",
                 unitProfit: "单件利润", profitMargin: "利润率",
                 monthlyProfitEst: "月利润（预估）",
@@ -652,7 +757,20 @@
                 shippingCost: "Frais de transport", packagingCost: "Emballage", otherCost: "Autres coûts",
                 fulfillmentSection: "Frais de livraison entrepôt (Octopia Fulfillment)",
                 productWeight: "Poids du produit",
-                fulfillmentNote: "💡 Frais Octopia Fulfillment (M30≤30kg) pour Cdiscount, inclut picking, emballage et livraison. 0 = expédition propre. Tarifs Octopia 2025",
+                pkgDimSum: "Somme L+l+H de l'emballage",
+                p30Category: "Catégorie gros colis (P30)",
+                fulfillmentNote: "💡 Poids>30kg ou L+l+H>200cm bascule automatiquement sur les tarifs P30 (par catégorie). Surcharges hors gabarit incluses. 0 = expédition propre. Tarifs Octopia 2025 (M30 p.12 / P30 p.13)",
+                modeM30: "M30 petit colis (≤30kg et L+l+H≤200cm)",
+                modeP30: "P30 gros colis (>30kg ou L+l+H>200cm)",
+                modeNone: "Expédition propre (sans entrepôt)",
+                ffBase: "Frais de livraison de base",
+                ffOversize: "Surcharge hors gabarit",
+                ffReturn: "Frais de retour/unité",
+                warnWeightOver: "⚠️ Poids hors grille tarifaire Octopia, demandez un devis",
+                warnDimOver: "⚠️ L+l+H >5m hors grille tarifaire, devis nécessaire",
+                longStorage: "Stockage > 1 an",
+                storageRate15: "€15/m³/mois",
+                storageRate50: "€50/m³/mois (>1 an)",
                 marketingCost: "Marketing", adCost: "Publicité", promoCost: "Promotions",
                 afterSalesCost: "Service après-vente", returnRate: "Taux de retour",
                 platformFees: "Frais plateforme", category: "Catégorie",
@@ -670,6 +788,8 @@
                 storageFeeLabel: "Frais de stockage (Octopia Fulfillment)",
                 adCostLabel: "Publicité + Promotions",
                 returnCostLabel: "Coût des retours",
+                oversizeFeeLabel: "Surcharge hors gabarit",
+                returnHandlingLabel: "Frais de traitement retour (Octopia)",
                 totalCostEur: "Coût achat+logistique (€)",
                 unitProfit: "Profit par unité", profitMargin: "Marge",
                 monthlyProfitEst: "Profit mensuel (est.)",
@@ -692,7 +812,20 @@
                 shippingCost: "Shipping to warehouse", packagingCost: "Packaging", otherCost: "Other Costs",
                 fulfillmentSection: "Warehouse Fulfillment Fee (Octopia Fulfillment)",
                 productWeight: "Product Weight",
-                fulfillmentNote: "💡 Octopia Fulfillment (M30≤30kg) fee for Cdiscount, includes picking, packing & delivery. Enter 0 for self-shipping. Rates: Octopia 2025",
+                pkgDimSum: "Package L+W+H total",
+                p30Category: "Bulky category (P30)",
+                fulfillmentNote: "💡 Weight>30kg or L+W+H>200cm automatically switches to P30 bulky rates (by category). Oversize surcharges included. Enter 0 for self-shipping. Rates: Octopia 2025 (M30 p.12 / P30 p.13)",
+                modeM30: "M30 small parcel (≤30kg and L+W+H≤200cm)",
+                modeP30: "P30 bulky (>30kg or L+W+H>200cm)",
+                modeNone: "Self-shipping (no warehouse)",
+                ffBase: "Base delivery fee",
+                ffOversize: "Oversize surcharge",
+                ffReturn: "Return handling/unit",
+                warnWeightOver: "⚠️ Weight beyond the Octopia rate card, request a custom quote",
+                warnDimOver: "⚠️ L+W+H >5m beyond the rate card, custom quote needed",
+                longStorage: "Stored over 1 year",
+                storageRate15: "€15/m³/month",
+                storageRate50: "€50/m³/month (>1 year)",
                 marketingCost: "Marketing", adCost: "Advertising", promoCost: "Promotions",
                 afterSalesCost: "After-Sales", returnRate: "Return Rate",
                 platformFees: "Platform Fees", category: "Category",
@@ -710,6 +843,8 @@
                 storageFeeLabel: "Storage fee (Octopia Fulfillment)",
                 adCostLabel: "Advertising + Promotions",
                 returnCostLabel: "Return cost",
+                oversizeFeeLabel: "Oversize surcharge",
+                returnHandlingLabel: "Return handling fee (Octopia)",
                 totalCostEur: "Purchase+logistics cost (€)",
                 unitProfit: "Unit Profit", profitMargin: "Profit Margin",
                 monthlyProfitEst: "Monthly Profit (est.)",
@@ -756,15 +891,59 @@
                 if (i18n[lang][key]) el.textContent = i18n[lang][key];
             });
             buildCategorySelect();
+            buildP30Select();
             updateCommission();
+            updateFulfillmentFee();
+            updateStorageFeeDisplay();
             if (!document.getElementById('resultSection').classList.contains('hidden')) calculate();
             loadHistory();
         }
 
-        function updateFulfillmentFee() {
+        function buildP30Select() {
+            const sel = document.getElementById('p30Category');
+            const prevIdx = sel.selectedIndex;
+            sel.innerHTML = '';
+            octopiaP30Categories.forEach((cat, i) => {
+                const opt = document.createElement('option');
+                opt.value = i;
+                opt.textContent = cat[currentLang];
+                sel.appendChild(opt);
+            });
+            sel.selectedIndex = prevIdx >= 0 ? prevIdx : 0;
+        }
+
+        // 读取当前海外仓输入，返回费用明细对象
+        function readFulfillment() {
             const w = parseFloat(document.getElementById('productWeight').value) || 0;
-            const fee = getOctopiaFulfillmentFee(w);
-            document.getElementById('fulfillmentFeeDisplay').textContent = w > 0 ? '€ ' + fee.toFixed(2) : '€ 0.00';
+            const d = parseFloat(document.getElementById('pkgDimSum').value) || 0;
+            const idx = parseInt(document.getElementById('p30Category').value, 10) || 0;
+            return getOctopiaFulfillment(w, d, idx);
+        }
+
+        function updateFulfillmentFee() {
+            const lang = i18n[currentLang];
+            const ff = readFulfillment();
+
+            // P30 品类下拉只在大件模式显示
+            document.getElementById('p30CategoryRow').style.display = (ff.mode === 'P30') ? '' : 'none';
+
+            document.getElementById('fulfillmentFeeDisplay').textContent = '€ ' + ff.total.toFixed(2);
+            document.getElementById('oversizeFeeDisplay').textContent = '€ ' + ff.surcharge.toFixed(2);
+
+            const bd = document.getElementById('fulfillmentBreakdown');
+            if (ff.mode === 'none') {
+                bd.innerHTML = '<span style="color:#484f58;">' + lang.modeNone + '</span>';
+            } else {
+                const modeTxt = ff.mode === 'M30' ? lang.modeM30 : lang.modeP30;
+                let html = '<span style="color:#a78bfa;font-weight:600;">' + modeTxt + '</span><br>'
+                         + lang.ffBase + '：€' + ff.base.toFixed(2)
+                         + ' &nbsp;+&nbsp; ' + lang.ffOversize + '：€' + ff.surcharge.toFixed(2)
+                         + ' &nbsp;=&nbsp; <span style="color:#e6edf3;font-weight:600;">€' + ff.total.toFixed(2) + '</span><br>'
+                         + lang.ffReturn + '：€' + ff.returnFee.toFixed(2);
+                if (ff.warn === 'weightOver') html += '<br><span style="color:#f85149;">' + lang.warnWeightOver + '</span>';
+                else if (ff.warn === 'dimOver') html += '<br><span style="color:#f85149;">' + lang.warnDimOver + '</span>';
+                bd.innerHTML = html;
+            }
         }
 
         async function fetchLiveRate() {
@@ -786,12 +965,20 @@
             }
         }
 
+        // 仓储费率：常规 15€/m³/月；存储超过 1 年 50€/m³/月（PDF 第11页）
+        function getStorageRate() {
+            return document.getElementById('longStorage').checked ? 50 : 15;
+        }
+
         function updateStorageFeeDisplay() {
+            const lang = i18n[currentLang];
             const vol = parseFloat(document.getElementById('storageVolume').value) || 0;
             const sales = parseFloat(document.getElementById('monthlySales').value) || 100;
-            const perUnit = vol > 0 ? (vol * 15 / sales) : 0;
+            const rate = getStorageRate();
+            const perUnit = vol > 0 ? (vol * rate / sales) : 0;
             const info = document.getElementById('storageFeeInfo');
-            info.textContent = vol > 0 ? '≈ €' + perUnit.toFixed(3) + (currentLang === 'zh' ? '/件' : '/pcs') : i18n[currentLang].storageNote;
+            info.textContent = vol > 0 ? '≈ €' + perUnit.toFixed(3) + (currentLang === 'zh' ? '/件' : '/pcs') : lang.storageNote;
+            document.getElementById('storageRateInfo').textContent = rate === 50 ? lang.storageRate50 : lang.storageRate15;
         }
 
         function updateCommission() {
@@ -844,9 +1031,11 @@
             const vatFrac = vatPct / 100;
             const cdCommRate = parseFloat(document.getElementById('cdiscountCommission').value) / 100 || 0.15;
             const storageVol = parseFloat(document.getElementById('storageVolume').value) || 0;
-            const storageFeePerUnit = sales > 0 ? (storageVol * 15) / sales : 0;
-            const weight = parseFloat(document.getElementById('productWeight').value) || 0;
-            const fulfillmentFee = getOctopiaFulfillmentFee(weight);
+            const storageFeePerUnit = sales > 0 ? (storageVol * getStorageRate()) / sales : 0;
+            const ff = readFulfillment();
+            const fulfillmentFee = ff.base;
+            const oversizeFee = ff.surcharge;
+            const returnHandlingFee = ff.returnFee * returnRateVal;  // 按退货率摊到每单
 
             if (sp <= 0) { alert(lang.enterPrice); return; }
 
@@ -858,8 +1047,8 @@
             const monthlyFee = 39.99 / sales;
             const commission = sp * cdCommRate;
 
-            const profit = sp - vatAmount - commission - fulfillmentFee - adCost - promoCost
-                          - returnCost - storageFeePerUnit - monthlyFee - totalCostEUR;
+            const profit = sp - vatAmount - commission - fulfillmentFee - oversizeFee - adCost - promoCost
+                          - returnCost - returnHandlingFee - storageFeePerUnit - monthlyFee - totalCostEUR;
             const margin = sp > 0 ? (profit / sp * 100) : 0;
             const monthlyProfit = profit * sales;
 
@@ -870,6 +1059,10 @@
             document.getElementById('cd-comm-rate').textContent = (cdCommRate * 100).toFixed(1);
             document.getElementById('cd-comm').textContent = '-€' + commission.toFixed(2);
             document.getElementById('cd-fulfillment').textContent = fulfillmentFee > 0 ? '-€' + fulfillmentFee.toFixed(2) : '€0.00';
+            document.getElementById('cd-ff-mode').textContent = ff.mode === 'none' ? '' : '(' + ff.mode + ')';
+            document.getElementById('cd-oversize-row').style.display = oversizeFee > 0 ? '' : 'none';
+            document.getElementById('cd-oversize').textContent = '-€' + oversizeFee.toFixed(2);
+            document.getElementById('cd-return-handling').textContent = '-€' + returnHandlingFee.toFixed(2);
             document.getElementById('cd-monthly-fee').textContent = '-€' + monthlyFee.toFixed(2);
             document.getElementById('cd-storage').textContent = '-€' + storageFeePerUnit.toFixed(2);
             document.getElementById('cd-ad-promo').textContent = '-€' + (adCost + promoCost).toFixed(2);
@@ -906,6 +1099,12 @@
                 ['Shipping Cost (CNY)', document.getElementById('shippingCost').value],
                 ['Category', catName],
                 ['Product Weight (kg)', document.getElementById('productWeight').value],
+                ['Package L+W+H (cm)', document.getElementById('pkgDimSum').value],
+                ['Fulfillment mode', document.getElementById('cd-ff-mode').textContent.replace(/[()]/g, '')],
+                ['Fulfillment fee (EUR)', document.getElementById('cd-fulfillment').textContent],
+                ['Oversize surcharge (EUR)', document.getElementById('cd-oversize').textContent],
+                ['Return handling fee (EUR)', document.getElementById('cd-return-handling').textContent],
+                ['Long-term storage (>1y)', document.getElementById('longStorage').checked ? 'yes' : 'no'],
                 ['Monthly Sales', document.getElementById('monthlySales').value],
                 [''],
                 ['Unit Profit', document.getElementById('cd-profit').textContent],
@@ -939,6 +1138,9 @@
                 promoRate: document.getElementById('promoRate').value,
                 returnRate: document.getElementById('returnRate').value,
                 productWeight: document.getElementById('productWeight').value,
+                pkgDimSum: document.getElementById('pkgDimSum').value,
+                p30CategoryIndex: document.getElementById('p30Category').selectedIndex,
+                longStorage: document.getElementById('longStorage').checked,
                 storageVolume: document.getElementById('storageVolume').value,
                 monthlySales: document.getElementById('monthlySales').value,
                 exchangeRate: document.getElementById('exchangeRate').value,
@@ -989,12 +1191,15 @@
             document.getElementById('promoRate').value = r.promoRate || '0';
             document.getElementById('returnRate').value = r.returnRate || '5';
             document.getElementById('productWeight').value = r.productWeight || '0';
+            document.getElementById('pkgDimSum').value = r.pkgDimSum || '0';
+            document.getElementById('p30Category').selectedIndex = r.p30CategoryIndex || 0;
+            document.getElementById('longStorage').checked = !!r.longStorage;
             document.getElementById('storageVolume').value = r.storageVolume || '0';
             document.getElementById('monthlySales').value = r.monthlySales || '100';
             document.getElementById('exchangeRate').value = r.exchangeRate || '0.126';
             document.getElementById('vatRate').value = r.vatRate || '20';
             if (r.categoryIndex !== undefined) document.getElementById('category').selectedIndex = r.categoryIndex;
-            updateCommission(); updateFulfillmentFee(); calculate();
+            updateCommission(); updateFulfillmentFee(); updateStorageFeeDisplay(); calculate();
             window.scrollTo({ top: 0, behavior: 'smooth' });
             showToast(lang.loadedFromHistory);
         }
@@ -1016,7 +1221,10 @@
 
         // Init
         buildCategorySelect();
+        buildP30Select();
         liveConvert();
+        updateFulfillmentFee();
+        updateStorageFeeDisplay();
         loadHistory();
     </script>
 </body>
